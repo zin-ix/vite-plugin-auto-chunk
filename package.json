@@ -1,6 +1,6 @@
 {
   "name": "vite-plugin-smart-split",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Vite plugin that scans your node_modules, auto-splits heavy packages into their own chunks, and detects lazy-load opportunities",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -22,7 +22,15 @@
     "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["vite", "plugin", "chunks", "code-splitting", "lazy-loading", "bundle", "optimizer"],
+  "keywords": [
+    "vite",
+    "plugin",
+    "chunks",
+    "code-splitting",
+    "lazy-loading",
+    "bundle",
+    "optimizer"
+  ],
   "license": "MIT",
   "peerDependencies": {
     "vite": ">=4.0.0"
