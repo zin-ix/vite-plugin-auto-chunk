@@ -6,6 +6,7 @@ interface AutoChunkOptions {
     extraVendors?: string[];
     summary?: boolean;
     suppressAnnotations?: boolean;
+    manualChunks?: Record<string, string[]>;
 }
 declare function autoChunk(options?: AutoChunkOptions): Plugin;
 

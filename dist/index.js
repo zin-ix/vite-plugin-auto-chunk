@@ -39,23 +39,35 @@ function measureNodeModules(root) {
           for (const scoped of readdirSync(scopePath, { withFileTypes: true })) {
             if (!scoped.isDirectory()) continue;
             const pkgName = `${entry.name}/${scoped.name}`;
-            const pkgJsonPath = join(scopePath, scoped.name, "package.json");
+            const pkgPath = join(scopePath, scoped.name);
+            const pkgJsonPath = join(pkgPath, "package.json");
             if (existsSync(pkgJsonPath)) {
-              sizes.set(pkgName, getDirSize(join(scopePath, scoped.name)));
+              sizes.set(pkgName, getDirSize(pkgPath));
             }
           }
         } catch {
         }
       } else {
-        const pkgJsonPath = join(nmPath, entry.name, "package.json");
+        const pkgPath = join(nmPath, entry.name);
+        const pkgJsonPath = join(pkgPath, "package.json");
         if (existsSync(pkgJsonPath)) {
-          sizes.set(entry.name, getDirSize(join(nmPath, entry.name)));
+          sizes.set(entry.name, getDirSize(pkgPath));
         }
       }
     }
   } catch {
   }
   return sizes;
+}
+function buildUserChunkMap(manualChunks) {
+  const map = /* @__PURE__ */ new Map();
+  if (!manualChunks) return map;
+  for (const [chunkName, pkgs] of Object.entries(manualChunks)) {
+    for (const pkg of pkgs) {
+      map.set(pkg, chunkName);
+    }
+  }
+  return map;
 }
 function buildChunkMap(root, heavyThresholdKB, extraVendors) {
   const chunkMap = /* @__PURE__ */ new Map();
@@ -68,9 +80,9 @@ function buildChunkMap(root, heavyThresholdKB, extraVendors) {
       continue;
     }
     let grouped = false;
-    for (const [groupName, prefixes] of Object.entries(ECOSYSTEM_GROUPS)) {
+    for (const [group, prefixes] of Object.entries(ECOSYSTEM_GROUPS)) {
       if (prefixes.some((p) => pkg === p || pkg.startsWith(p))) {
-        chunkMap.set(pkg, groupName);
+        chunkMap.set(pkg, group);
         grouped = true;
         break;
       }
@@ -83,14 +95,20 @@ function buildChunkMap(root, heavyThresholdKB, extraVendors) {
   }
   return chunkMap;
 }
-function resolveChunk(id, chunkMap) {
+function resolveChunk(id, autoMap, userMap) {
   if (!id.includes("node_modules")) return void 0;
   const nmIndex = id.lastIndexOf("node_modules/");
   const afterNm = id.slice(nmIndex + "node_modules/".length);
   const pkg = afterNm.startsWith("@") ? afterNm.split("/").slice(0, 2).join("/") : afterNm.split("/")[0];
-  if (chunkMap.has(pkg)) return chunkMap.get(pkg);
-  for (const [key, chunk] of chunkMap.entries()) {
-    if (pkg.startsWith(key)) return chunk;
+  if (userMap.has(pkg)) {
+    return userMap.get(pkg);
+  }
+  if (autoMap.has(pkg)) {
+    return autoMap.get(pkg);
+  }
+  for (const [key, chunk] of autoMap.entries()) {
+    const isMatch = pkg === key || pkg.startsWith(key + "/");
+    if (isMatch) return chunk;
   }
   return "vendor-misc";
 }
@@ -112,7 +130,7 @@ function detectStaticRoutes(root) {
     const staticCount = total - lazy;
     if (staticCount > 0) {
       return [
-        `${staticCount} of ${total} route(s) in ${rel} use static imports.`,
+        `${staticCount} of ${total} route(s) use static imports in ${rel}.`,
         `Convert to lazy: component: () => import('./YourView.vue')`
       ];
     }
@@ -128,10 +146,12 @@ function autoChunk(options = {}) {
     warnThreshold = 500,
     extraVendors = [],
     summary = true,
-    suppressAnnotations = true
+    suppressAnnotations = true,
+    manualChunks: userManualChunks
   } = options;
-  let chunkMap = /* @__PURE__ */ new Map();
   let projectRoot = process.cwd();
+  let autoMap = /* @__PURE__ */ new Map();
+  let userMap = /* @__PURE__ */ new Map();
   const chunkSizes = {};
   return {
     name: "vite-plugin-auto-chunk",
@@ -142,32 +162,16 @@ function autoChunk(options = {}) {
     config(existingConfig) {
       const output = existingConfig.build?.rollupOptions?.output;
       const hasManualChunks = output && !Array.isArray(output) && typeof output === "object" && "manualChunks" in output;
-      if (hasManualChunks) {
-        console.log("\n[auto-chunk] manualChunks already defined \u2014 skipping.\n");
-        return;
-      }
-      chunkMap = buildChunkMap(projectRoot, heavyThreshold, extraVendors);
-      const ecosystemNames = Object.keys(ECOSYSTEM_GROUPS);
-      const heavy = [...chunkMap.entries()].filter(
-        ([, v]) => !ecosystemNames.includes(v) && v !== "vendor-misc"
-      );
-      if (heavy.length > 0) {
-        console.log(`
-[auto-chunk] ${heavy.length} heavy package(s) detected \u2014 each gets its own chunk:`);
-        for (const [pkg, chunk] of heavy.slice(0, 8)) {
-          console.log(`  ${pkg.padEnd(35)} -> ${chunk}`);
-        }
-        if (heavy.length > 8) console.log(`  ... and ${heavy.length - 8} more`);
-        console.log();
-      }
+      const userChunksFromVite = hasManualChunks && typeof output.manualChunks === "object" ? output.manualChunks : void 0;
+      userMap = buildUserChunkMap(userChunksFromVite || userManualChunks);
+      autoMap = buildChunkMap(projectRoot, heavyThreshold, extraVendors);
+      const mergedManualChunks = (id) => resolveChunk(id, autoMap, userMap);
       return {
         build: {
           chunkSizeWarningLimit: warnThreshold,
           rollupOptions: {
             output: {
-              manualChunks(id) {
-                return resolveChunk(id, chunkMap);
-              }
+              manualChunks: mergedManualChunks
             }
           }
         }
@@ -175,7 +179,7 @@ function autoChunk(options = {}) {
     },
     buildStart() {
       const hints = detectStaticRoutes(projectRoot);
-      if (hints.length > 0) {
+      if (hints.length) {
         console.log("[auto-chunk] Lazy-load hint:");
         hints.forEach((h) => console.log(" ", h));
         console.log();
@@ -196,12 +200,10 @@ function autoChunk(options = {}) {
       }
     },
     closeBundle() {
-      if (!summary || Object.keys(chunkSizes).length === 0) return;
+      if (!summary || !Object.keys(chunkSizes).length) return;
       const sorted = Object.entries(chunkSizes).sort((a, b) => b[1] - a[1]);
       const total = sorted.reduce((s, [, n]) => s + n, 0);
       const over = sorted.filter(([, n]) => n > warnThreshold * 1024);
-      const W = 42;
-      const col = (s, width) => s.length > width ? s.slice(0, width - 1) + "~" : s.padEnd(width);
       console.log("\n+------------------------------------------+------------+");
       console.log("|        auto-chunk - build summary        |            |");
       console.log("+------------------------------------------+------------+");
@@ -209,15 +211,14 @@ function autoChunk(options = {}) {
       console.log("+------------------------------------------+------------+");
       for (const [name, size] of sorted.slice(0, 15)) {
         const flag = size > warnThreshold * 1024 ? "! " : "  ";
-        const short = name.split("/").pop() ?? name;
-        console.log(`| ${flag}${col(short, W)}| ${col(formatKB(size), 10)} |`);
+        console.log(`| ${flag}${name.padEnd(40).slice(0, 40)}| ${formatKB(size).padEnd(10)} |`);
       }
       if (sorted.length > 15) {
-        console.log(`|   ... ${sorted.length - 15} more chunks${" ".repeat(W - 10)}|            |`);
+        console.log(`|   ... ${sorted.length - 15} more chunks                      |            |`);
       }
       console.log("+------------------------------------------+------------+");
-      console.log(`|   Total${" ".repeat(W - 4)}| ${col(formatKB(total), 10)} |`);
-      console.log(`|   Chunks over ${warnThreshold}kB: ${String(over.length).padEnd(W - 13)}|            |`);
+      console.log(`| Total                                    | ${formatKB(total).padEnd(10)} |`);
+      console.log(`| Over limit chunks: ${String(over.length).padEnd(15)}           |`);
       console.log("+------------------------------------------+------------+\n");
     }
   };
