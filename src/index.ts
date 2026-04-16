@@ -3,16 +3,14 @@ import { readFileSync, existsSync, readdirSync, statSync } from 'fs'
 import { resolve, join } from 'path'
 
 export interface AutoChunkOptions {
-  // KB threshold before a package is split into its own chunk (default: 100)
   heavyThreshold?: number
-  // KB threshold for build warnings (default: 500)
   warnThreshold?: number
-  // Force-split specific packages regardless of size
   extraVendors?: string[]
-  // Print build summary table after build (default: true)
   summary?: boolean
-  // Suppress harmless annotation warnings from libs like SignalR (default: true)
   suppressAnnotations?: boolean
+
+  // NEW: allow user-defined manual chunks
+  manualChunks?: Record<string, string[]>
 }
 
 const ECOSYSTEM_GROUPS: Record<string, string[]> = {
@@ -21,6 +19,8 @@ const ECOSYSTEM_GROUPS: Record<string, string[]> = {
   'vendor-svelte': ['svelte', '@sveltejs'],
   'vendor-solid': ['solid-js', '@solidjs'],
 }
+
+/* ------------------------- FILE SIZE HELPERS ------------------------- */
 
 function getDirSize(dirPath: string): number {
   let total = 0
@@ -31,10 +31,10 @@ function getDirSize(dirPath: string): number {
         if (entry.name === 'node_modules') continue
         total += getDirSize(full)
       } else if (entry.isFile()) {
-        try { total += statSync(full).size } catch { /* skip */ }
+        try { total += statSync(full).size } catch {}
       }
     }
-  } catch { /* skip */ }
+  } catch {}
   return total
 }
 
@@ -53,23 +53,44 @@ function measureNodeModules(root: string): Map<string, number> {
           for (const scoped of readdirSync(scopePath, { withFileTypes: true })) {
             if (!scoped.isDirectory()) continue
             const pkgName = `${entry.name}/${scoped.name}`
-            const pkgJsonPath = join(scopePath, scoped.name, 'package.json')
+            const pkgPath = join(scopePath, scoped.name)
+            const pkgJsonPath = join(pkgPath, 'package.json')
             if (existsSync(pkgJsonPath)) {
-              sizes.set(pkgName, getDirSize(join(scopePath, scoped.name)))
+              sizes.set(pkgName, getDirSize(pkgPath))
             }
           }
-        } catch { /* skip */ }
+        } catch {}
       } else {
-        const pkgJsonPath = join(nmPath, entry.name, 'package.json')
+        const pkgPath = join(nmPath, entry.name)
+        const pkgJsonPath = join(pkgPath, 'package.json')
         if (existsSync(pkgJsonPath)) {
-          sizes.set(entry.name, getDirSize(join(nmPath, entry.name)))
+          sizes.set(entry.name, getDirSize(pkgPath))
         }
       }
     }
-  } catch { /* skip */ }
+  } catch {}
 
   return sizes
 }
+
+/* ------------------------- USER CHUNK MAP ------------------------- */
+
+function buildUserChunkMap(
+  manualChunks?: Record<string, string[]>
+): Map<string, string> {
+  const map = new Map<string, string>()
+  if (!manualChunks) return map
+
+  for (const [chunkName, pkgs] of Object.entries(manualChunks)) {
+    for (const pkg of pkgs) {
+      map.set(pkg, chunkName)
+    }
+  }
+
+  return map
+}
+
+/* ------------------------- AUTO CHUNK MAP ------------------------- */
 
 function buildChunkMap(
   root: string,
@@ -82,22 +103,25 @@ function buildChunkMap(
   for (const [pkg, bytes] of sizes.entries()) {
     const kb = bytes / 1024
 
-    if (extraVendors.some((e) => pkg === e || pkg.startsWith(e + '/'))) {
+    // force vendors
+    if (extraVendors.some(e => pkg === e || pkg.startsWith(e + '/'))) {
       const safeName = pkg.replace('@', '').replace('/', '-')
       chunkMap.set(pkg, `vendor-${safeName}`)
       continue
     }
 
+    // ecosystem grouping
     let grouped = false
-    for (const [groupName, prefixes] of Object.entries(ECOSYSTEM_GROUPS)) {
-      if (prefixes.some((p) => pkg === p || pkg.startsWith(p))) {
-        chunkMap.set(pkg, groupName)
+    for (const [group, prefixes] of Object.entries(ECOSYSTEM_GROUPS)) {
+      if (prefixes.some(p => pkg === p || pkg.startsWith(p))) {
+        chunkMap.set(pkg, group)
         grouped = true
         break
       }
     }
     if (grouped) continue
 
+    // heavy package isolation
     if (kb >= heavyThresholdKB) {
       const safeName = pkg.replace('@', '').replace('/', '-')
       chunkMap.set(pkg, `vendor-${safeName}`)
@@ -107,29 +131,50 @@ function buildChunkMap(
   return chunkMap
 }
 
-function resolveChunk(id: string, chunkMap: Map<string, string>): string | undefined {
+/* ------------------------- CHUNK RESOLVER ------------------------- */
+
+function resolveChunk(
+  id: string,
+  autoMap: Map<string, string>,
+  userMap: Map<string, string>
+): string | undefined {
   if (!id.includes('node_modules')) return undefined
 
   const nmIndex = id.lastIndexOf('node_modules/')
   const afterNm = id.slice(nmIndex + 'node_modules/'.length)
+
   const pkg = afterNm.startsWith('@')
     ? afterNm.split('/').slice(0, 2).join('/')
     : afterNm.split('/')[0]
 
-  if (chunkMap.has(pkg)) return chunkMap.get(pkg)!
+  // 1. USER OVERRIDE (highest priority)
+  if (userMap.has(pkg)) {
+    return userMap.get(pkg)!
+  }
 
-  for (const [key, chunk] of chunkMap.entries()) {
-    if (pkg.startsWith(key)) return chunk
+  // 2. AUTO MAP
+  if (autoMap.has(pkg)) {
+    return autoMap.get(pkg)!
+  }
+
+  for (const [key, chunk] of autoMap.entries()) {
+    const isMatch = pkg === key || pkg.startsWith(key + '/')
+    if (isMatch) return chunk
   }
 
   return 'vendor-misc'
 }
 
+/* ------------------------- ROUTE ANALYZER ------------------------- */
+
 function detectStaticRoutes(root: string): string[] {
   const candidates = [
-    'src/router/index.ts', 'src/router/index.js',
-    'src/router.ts', 'src/router.js',
-    'src/routes/index.ts', 'src/routes/index.js',
+    'src/router/index.ts',
+    'src/router/index.js',
+    'src/router.ts',
+    'src/router.js',
+    'src/routes/index.ts',
+    'src/routes/index.js',
   ]
 
   for (const rel of candidates) {
@@ -143,7 +188,7 @@ function detectStaticRoutes(root: string): string[] {
 
     if (staticCount > 0) {
       return [
-        `${staticCount} of ${total} route(s) in ${rel} use static imports.`,
+        `${staticCount} of ${total} route(s) use static imports in ${rel}.`,
         `Convert to lazy: component: () => import('./YourView.vue')`,
       ]
     }
@@ -152,9 +197,13 @@ function detectStaticRoutes(root: string): string[] {
   return []
 }
 
+/* ------------------------- UTIL ------------------------- */
+
 function formatKB(bytes: number): string {
   return (bytes / 1024).toFixed(1) + ' kB'
 }
+
+/* ------------------------- PLUGIN ------------------------- */
 
 export function autoChunk(options: AutoChunkOptions = {}): Plugin {
   const {
@@ -163,15 +212,17 @@ export function autoChunk(options: AutoChunkOptions = {}): Plugin {
     extraVendors = [],
     summary = true,
     suppressAnnotations = true,
+    manualChunks: userManualChunks,
   } = options
 
-  let chunkMap = new Map<string, string>()
   let projectRoot = process.cwd()
+  let autoMap = new Map<string, string>()
+  let userMap = new Map<string, string>()
   const chunkSizes: Record<string, number> = {}
 
   return {
     name: 'vite-plugin-auto-chunk',
-    enforce: 'pre' as const,
+    enforce: 'pre',
 
     configResolved(config: ResolvedConfig) {
       projectRoot = config.root
@@ -179,41 +230,32 @@ export function autoChunk(options: AutoChunkOptions = {}): Plugin {
 
     config(existingConfig: UserConfig) {
       const output = existingConfig.build?.rollupOptions?.output
+
       const hasManualChunks =
         output &&
         !Array.isArray(output) &&
         typeof output === 'object' &&
         'manualChunks' in output
 
-      if (hasManualChunks) {
-        console.log('\n[auto-chunk] manualChunks already defined — skipping.\n')
-        return
-      }
+      // if Vite user defines manualChunks, still MERGE instead of skipping
+      const userChunksFromVite =
+        hasManualChunks && typeof output.manualChunks === 'object'
+          ? (output.manualChunks as Record<string, string[]>)
+          : undefined
 
-      chunkMap = buildChunkMap(projectRoot, heavyThreshold, extraVendors)
+      userMap = buildUserChunkMap(userChunksFromVite || userManualChunks)
 
-      const ecosystemNames = Object.keys(ECOSYSTEM_GROUPS)
-      const heavy = [...chunkMap.entries()].filter(
-        ([, v]) => !ecosystemNames.includes(v) && v !== 'vendor-misc'
-      )
+      autoMap = buildChunkMap(projectRoot, heavyThreshold, extraVendors)
 
-      if (heavy.length > 0) {
-        console.log(`\n[auto-chunk] ${heavy.length} heavy package(s) detected — each gets its own chunk:`)
-        for (const [pkg, chunk] of heavy.slice(0, 8)) {
-          console.log(`  ${pkg.padEnd(35)} -> ${chunk}`)
-        }
-        if (heavy.length > 8) console.log(`  ... and ${heavy.length - 8} more`)
-        console.log()
-      }
+      const mergedManualChunks = (id: string) =>
+        resolveChunk(id, autoMap, userMap)
 
       return {
         build: {
           chunkSizeWarningLimit: warnThreshold,
           rollupOptions: {
             output: {
-              manualChunks(id: string) {
-                return resolveChunk(id, chunkMap)
-              },
+              manualChunks: mergedManualChunks,
             },
           },
         },
@@ -222,9 +264,9 @@ export function autoChunk(options: AutoChunkOptions = {}): Plugin {
 
     buildStart() {
       const hints = detectStaticRoutes(projectRoot)
-      if (hints.length > 0) {
+      if (hints.length) {
         console.log('[auto-chunk] Lazy-load hint:')
-        hints.forEach((h) => console.log(' ', h))
+        hints.forEach(h => console.log(' ', h))
         console.log()
       }
     },
@@ -237,12 +279,13 @@ export function autoChunk(options: AutoChunkOptions = {}): Plugin {
         log.message.includes('annotation') &&
         log.message.includes('cannot interpret')
       ) {
-        return false as unknown as void
+        return false as any
       }
     },
 
-    generateBundle(_opts: unknown, bundle: Record<string, unknown>) {
+    generateBundle(_opts, bundle) {
       if (!summary) return
+
       for (const [name, chunk] of Object.entries(bundle)) {
         const c = chunk as { type: string; code?: string }
         if (c.type === 'chunk' && typeof c.code === 'string') {
@@ -252,15 +295,11 @@ export function autoChunk(options: AutoChunkOptions = {}): Plugin {
     },
 
     closeBundle() {
-      if (!summary || Object.keys(chunkSizes).length === 0) return
+      if (!summary || !Object.keys(chunkSizes).length) return
 
       const sorted = Object.entries(chunkSizes).sort((a, b) => b[1] - a[1])
       const total = sorted.reduce((s, [, n]) => s + n, 0)
       const over = sorted.filter(([, n]) => n > warnThreshold * 1024)
-      const W = 42
-
-      const col = (s: string, width: number) =>
-        s.length > width ? s.slice(0, width - 1) + '~' : s.padEnd(width)
 
       console.log('\n+------------------------------------------+------------+')
       console.log('|        auto-chunk - build summary        |            |')
@@ -270,17 +309,16 @@ export function autoChunk(options: AutoChunkOptions = {}): Plugin {
 
       for (const [name, size] of sorted.slice(0, 15)) {
         const flag = size > warnThreshold * 1024 ? '! ' : '  '
-        const short = name.split('/').pop() ?? name
-        console.log(`| ${flag}${col(short, W)}| ${col(formatKB(size), 10)} |`)
+        console.log(`| ${flag}${name.padEnd(40).slice(0, 40)}| ${formatKB(size).padEnd(10)} |`)
       }
 
       if (sorted.length > 15) {
-        console.log(`|   ... ${sorted.length - 15} more chunks${' '.repeat(W - 10)}|            |`)
+        console.log(`|   ... ${sorted.length - 15} more chunks                      |            |`)
       }
 
       console.log('+------------------------------------------+------------+')
-      console.log(`|   Total${' '.repeat(W - 4)}| ${col(formatKB(total), 10)} |`)
-      console.log(`|   Chunks over ${warnThreshold}kB: ${String(over.length).padEnd(W - 13)}|            |`)
+      console.log(`| Total                                    | ${formatKB(total).padEnd(10)} |`)
+      console.log(`| Over limit chunks: ${String(over.length).padEnd(15)}           |`)
       console.log('+------------------------------------------+------------+\n')
     },
   }
